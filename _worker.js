@@ -85,13 +85,8 @@ export default {
 /** ---------------------tools------------------------------ */
 async function resolveConfig(request, env, kvData) {
     const url = new URL(request.url);
-    let paddr = url.searchParams.get('PADDR') ?? env.PADDR ?? paddrDefaul;
-    let pnum = pnumDefaul;
-    if (paddr) {
-        const [ip, port] = paddr.split(':');
-        paddr = ip;
-        pnum = port || pnum;
-    }
+    const rawPaddr = url.searchParams.get('PADDR') ?? env.PADDR ?? paddrDefaul;
+    const { hostname: paddr, port: pnum } = parseProxyAddress(rawPaddr, pnumDefaul);
     const rawP64 = url.searchParams.get('P64') ?? env.P64 ?? p64Defaul;
     const s5 = url.searchParams.get('S5') ?? env.S5 ?? s5Defaul;
     const parsedS5 = (await requestParserFromUrl(s5, url)) ?? parsedS5Defaul;
@@ -124,6 +119,35 @@ async function resolveConfig(request, env, kvData) {
     };
     log(`[config]-->[${Date.now()}]`, JSON.stringify(config));
     return config;
+}
+
+function parseProxyAddress(value, defaultPort = '443') {
+    const input = String(value ?? '').trim();
+    if (!input) return { hostname: '', port: defaultPort };
+
+    // Bracketed IPv6 may include an explicit port: [2001:db8::1]:2053
+    const bracketedIPv6 = input.match(/^\[([0-9a-f:.]+)\](?::(\d+))?$/i);
+    if (bracketedIPv6) {
+        const port = bracketedIPv6[2] || defaultPort;
+        const portNumber = Number(port);
+        if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) {
+            throw new Error(`Invalid PADDR port: ${port}`);
+        }
+        return { hostname: bracketedIPv6[1], port: portNumber };
+    }
+
+    // An unbracketed IPv6 address has multiple colons; treat it as a host
+    // without a port. Require brackets when an IPv6 port is specified.
+    const colonCount = (input.match(/:/g) || []).length;
+    if (colonCount > 1) return { hostname: input, port: Number(defaultPort) };
+
+    const hostPort = input.match(/^([^:]+)(?::(\d+))?$/);
+    if (!hostPort) throw new Error(`Invalid PADDR address: ${input}`);
+    const port = Number(hostPort[2] || defaultPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`Invalid PADDR port: ${hostPort[2]}`);
+    }
+    return { hostname: hostPort[1], port };
 }
 
 function log(...args) {
@@ -1700,7 +1724,20 @@ async function handleTPOut(remoteS, addressRemote, portRemote, rawClientData, pi
     const { finalHost, finalPort } = await getDomainToRouteX(addressRemote, portRemote, false, config);
     const isDirectTarget = finalHost === addressRemote && Number(finalPort) === Number(portRemote);
     const concurrency = isDirectTarget ? config.tcpDirectConcurrency : config.tcpProxyConcurrency;
-    const tcpS = await connectAndWrite(finalHost, finalPort, config.s5Enable ? true : false, concurrency);
+    let tcpS;
+    try {
+        tcpS = await connectAndWrite(finalHost, finalPort, config.s5Enable ? true : false, concurrency);
+    } catch (error) {
+        log(`[handleTPOut]--> Direct connection to ${finalHost}:${finalPort} failed; trying configured fallback: ${error.message || error}`);
+        try {
+            await finalStep();
+        } catch (fallbackError) {
+            log(`[handleTPOut]--> Fallback connection failed: ${fallbackError.message || fallbackError}`);
+            remoteS.close(fallbackError);
+            closeDataStream(pipe);
+        }
+        return;
+    }
     const generation = remoteS.generation;
     transferDataStream(tcpS, pipe, channelResponseHeader, finalStep, log, remoteS, generation).catch((error) => {
         log(`[transferDataStream]--> unhandled error: ${error.message || error}`);
